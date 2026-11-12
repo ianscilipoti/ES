@@ -54,21 +54,47 @@ impl BenchmarkInputProvider for KvBinInputProvider {
 
 pub struct GenSortInputProvider {
     pub path: PathBuf,
+    pub key_size: usize,
+    pub value_size: usize,
+}
+
+impl GenSortInputProvider {
+    /// Standard GenSort layout (10-byte keys, 90-byte payloads).
+    pub fn new(path: PathBuf) -> Self {
+        Self::with_record_layout(
+            path,
+            crate::input_reader::gensort_input_direct::GENSORT_KEY_SIZE,
+            crate::input_reader::gensort_input_direct::GENSORT_PAYLOAD_SIZE,
+        )
+    }
+
+    /// Fixed-size records with the given key and value sizes.
+    pub fn with_record_layout(path: PathBuf, key_size: usize, value_size: usize) -> Self {
+        Self {
+            path,
+            key_size,
+            value_size,
+        }
+    }
+
+    fn open(&self) -> Result<GenSortInputDirect, String> {
+        GenSortInputDirect::with_record_layout(&self.path, self.key_size, self.value_size)
+    }
 }
 
 impl BenchmarkInputProvider for GenSortInputProvider {
     fn create_sort_input(&self) -> Result<Box<dyn SortInput>, Box<dyn std::error::Error>> {
-        Ok(Box::new(GenSortInputDirect::new(&self.path)?))
+        Ok(Box::new(self.open()?))
     }
 
     fn estimate_data_size_mb(&self) -> Result<f64, Box<dyn std::error::Error>> {
-        let gensort_input = GenSortInputDirect::new(&self.path)?;
+        let gensort_input = self.open()?;
         let file_size = gensort_input.file_size()?;
         Ok(file_size as f64 / (1024.0 * 1024.0))
     }
 
     fn get_entry_count(&self) -> Option<usize> {
-        if let Ok(gensort_input) = GenSortInputDirect::new(&self.path) {
+        if let Ok(gensort_input) = self.open() {
             Some(gensort_input.len())
         } else {
             None
@@ -76,7 +102,10 @@ impl BenchmarkInputProvider for GenSortInputProvider {
     }
 
     fn get_description(&self) -> String {
-        format!("GenSort file: {:?}", self.path)
+        format!(
+            "GenSort file: {:?} (key {} B, value {} B)",
+            self.path, self.key_size, self.value_size
+        )
     }
 }
 

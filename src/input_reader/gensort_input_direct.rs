@@ -6,20 +6,39 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-// GenSort format constants
-const KEY_SIZE: usize = 10;
-const PAYLOAD_SIZE: usize = 90;
-const RECORD_SIZE: usize = KEY_SIZE + PAYLOAD_SIZE;
+// Default GenSort record layout: 10-byte key, 90-byte payload
+pub const GENSORT_KEY_SIZE: usize = 10;
+pub const GENSORT_PAYLOAD_SIZE: usize = 90;
 
-/// Direct I/O reader for GenSort binary format
+/// Direct I/O reader for fixed-size binary records (GenSort format by default).
+///
+/// Each record is `key_size` key bytes followed immediately by `value_size`
+/// value bytes, with no delimiters or length prefixes.
 #[derive(Clone)]
 pub struct GenSortInputDirect {
     fd: Arc<SharedFd>,
     num_records: usize,
+    key_size: usize,
+    value_size: usize,
 }
 
 impl GenSortInputDirect {
+    /// Open a standard GenSort file (10-byte keys, 90-byte payloads).
     pub fn new(path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::with_record_layout(path, GENSORT_KEY_SIZE, GENSORT_PAYLOAD_SIZE)
+    }
+
+    /// Open a file of fixed-size records with the given key and value sizes.
+    pub fn with_record_layout(
+        path: impl AsRef<Path>,
+        key_size: usize,
+        value_size: usize,
+    ) -> Result<Self, String> {
+        if key_size == 0 {
+            return Err("Key size must be greater than 0".to_string());
+        }
+        let record_size = key_size + value_size;
+
         let path = path.as_ref().to_path_buf();
 
         if !path.exists() {
@@ -38,16 +57,33 @@ impl GenSortInputDirect {
             .map_err(|e| format!("Failed to get file size for {:?}: {}", path, e))?;
 
         // Verify file size is a multiple of record size
-        if file_size % RECORD_SIZE as u64 != 0 {
+        if file_size % record_size as u64 != 0 {
             return Err(format!(
                 "File size {} is not a multiple of record size {}",
-                file_size, RECORD_SIZE
+                file_size, record_size
             ));
         }
 
-        let num_records = (file_size / RECORD_SIZE as u64) as usize;
+        let num_records = (file_size / record_size as u64) as usize;
 
-        Ok(Self { fd, num_records })
+        Ok(Self {
+            fd,
+            num_records,
+            key_size,
+            value_size,
+        })
+    }
+
+    pub fn key_size(&self) -> usize {
+        self.key_size
+    }
+
+    pub fn value_size(&self) -> usize {
+        self.value_size
+    }
+
+    pub fn record_size(&self) -> usize {
+        self.key_size + self.value_size
     }
 
     pub fn len(&self) -> usize {
@@ -87,6 +123,8 @@ impl SortInput for GenSortInputDirect {
                 self.fd.clone(),
                 start_record,
                 end_record,
+                self.key_size,
+                self.value_size,
                 io_tracker.clone(),
             );
 
@@ -113,6 +151,8 @@ struct GenSortScanner {
     reader: AlignedReader,
     current_record: usize,
     end_record: usize,
+    key_size: usize,
+    value_size: usize,
 }
 
 impl GenSortScanner {
@@ -120,6 +160,8 @@ impl GenSortScanner {
         fd: Arc<SharedFd>,
         start_record: usize,
         end_record: usize,
+        key_size: usize,
+        value_size: usize,
         io_tracker: Option<IoStatsTracker>,
     ) -> Result<Self, String> {
         // Open file with Direct I/O
@@ -134,13 +176,15 @@ impl GenSortScanner {
 
         // Seek to start position (must be aligned)
         reader
-            .seek((start_record * RECORD_SIZE) as u64)
+            .seek((start_record * (key_size + value_size)) as u64)
             .map_err(|e| format!("Failed to seek: {}", e))?;
 
         Ok(Self {
             reader,
             current_record: start_record,
             end_record,
+            key_size,
+            value_size,
         })
     }
 
@@ -149,8 +193,8 @@ impl GenSortScanner {
             return None;
         }
 
-        let mut key = vec![0u8; KEY_SIZE];
-        let mut payload = vec![0u8; PAYLOAD_SIZE];
+        let mut key = vec![0u8; self.key_size];
+        let mut payload = vec![0u8; self.value_size];
 
         // Read the next record into the buffer if needed
 
@@ -183,6 +227,10 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use tempfile::tempdir;
+
+    const KEY_SIZE: usize = GENSORT_KEY_SIZE;
+    const PAYLOAD_SIZE: usize = GENSORT_PAYLOAD_SIZE;
+    const RECORD_SIZE: usize = KEY_SIZE + PAYLOAD_SIZE;
 
     fn generate_gensort_data(num_records: usize) -> Vec<u8> {
         let mut data = Vec::with_capacity(num_records * RECORD_SIZE);
@@ -345,5 +393,63 @@ mod tests {
 
         // Should be no more records
         assert!(scanner.next().is_none());
+    }
+
+    /// Write packed 8-byte-key / 8-byte-value records (big-endian u64s).
+    fn create_8_8_file(keys: &[u64]) -> tempfile::TempPath {
+        let mut data = Vec::with_capacity(keys.len() * 16);
+        for &k in keys {
+            data.extend_from_slice(&k.to_be_bytes());
+            data.extend_from_slice(&(!k).to_be_bytes());
+        }
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&data).unwrap();
+        tmp.as_file_mut().sync_all().unwrap();
+        tmp.into_temp_path()
+    }
+
+    #[test]
+    fn test_8_8_layout_reads_all_records() {
+        // Enough records that scanner boundaries fall at non-block-aligned offsets.
+        let keys: Vec<u64> = (0..10_007u64)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+        let temp_file = create_8_8_file(&keys);
+        let input = GenSortInputDirect::with_record_layout(&temp_file, 8, 8).unwrap();
+        assert_eq!(input.len(), keys.len());
+        assert_eq!(input.record_size(), 16);
+
+        for num_scanners in [1, 3, 7] {
+            let mut got = Vec::new();
+            for scanner in input.create_parallel_scanners(num_scanners, None) {
+                for (key, value) in scanner {
+                    assert_eq!(key.len(), 8);
+                    assert_eq!(value.len(), 8);
+                    let k = u64::from_be_bytes(key.try_into().unwrap());
+                    let v = u64::from_be_bytes(value.try_into().unwrap());
+                    assert_eq!(v, !k);
+                    got.push(k);
+                }
+            }
+            assert_eq!(got, keys, "mismatch with {} scanners", num_scanners);
+        }
+    }
+
+    #[test]
+    fn test_8_8_layout_invalid_file_size() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&[0u8; 20]).unwrap(); // not a multiple of 16
+        tmp.as_file_mut().sync_all().unwrap();
+        let path = tmp.into_temp_path();
+        match GenSortInputDirect::with_record_layout(&path, 8, 8) {
+            Err(e) => assert!(e.contains("not a multiple of record size 16")),
+            Ok(_) => panic!("expected error for invalid file size"),
+        }
+    }
+
+    #[test]
+    fn test_zero_key_size_rejected() {
+        let temp_file = create_8_8_file(&[1, 2, 3]);
+        assert!(GenSortInputDirect::with_record_layout(&temp_file, 0, 16).is_err());
     }
 }

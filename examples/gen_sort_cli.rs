@@ -34,6 +34,14 @@ struct SortArgs {
     #[arg(short, long)]
     input: PathBuf,
 
+    /// Key size in bytes for each fixed-size record (GenSort default: 10)
+    #[arg(long, default_value = "10")]
+    key_size: usize,
+
+    /// Value size in bytes for each fixed-size record (GenSort default: 90)
+    #[arg(long, default_value = "90")]
+    value_size: usize,
+
     /// Directory for temporary files
     #[arg(short, long, default_value = ".")]
     dir: PathBuf,
@@ -121,7 +129,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = SortArgs::parse();
 
     // Create input provider for GenSort files
-    let input_provider = GenSortInputProvider { path: args.input };
+    let input_provider =
+        GenSortInputProvider::with_record_layout(args.input, args.key_size, args.value_size);
 
     // If only estimating size, compute and print, then exit
     if args.estimate_size {
