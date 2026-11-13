@@ -308,7 +308,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         verify: args.verify,
         temp_dir: args.dir,
         run_gen_threads,
-        use_ovc: args.ovc,
+        run_format: es::benchmark::RunFormatChoice::from_ovc_flag(args.ovc),
         rg_buf_mb,
         run_gen_memory_mb: rg_buf_mb * run_gen_threads as f64,
         merge_threads,
@@ -319,6 +319,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         imbalance_factor: args.imbalance_factor,
         partition_type,
         discard_final_output: args.discard_final_output,
+        output: None,
         sparse_index_fraction: args.sparse_index_fraction,
     };
 

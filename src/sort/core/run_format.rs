@@ -8,7 +8,7 @@ use crate::diskio::aligned_writer::AlignedWriter;
 use crate::diskio::file::SharedFd;
 use crate::diskio::io_stats::IoStatsTracker;
 use crate::ovc::offset_value_coding_32::OVCU32;
-use crate::sort::core::engine::SortHooks;
+use crate::sort::core::engine::{MergeTarget, SortHooks};
 use crate::sort::core::engine::{RunSummary, Scanner};
 use crate::sort::core::sparse_index::{SparseIndex, SparseIndexPagePool};
 use crate::sort::run_sink::RunSink;
@@ -21,6 +21,10 @@ pub trait RunFormat: Clone + Send + Sync + 'static {
     type Run: RunSummary + Send + Sync + 'static;
     type Record: Send + 'static;
     type AppendState: Default + Send + 'static;
+
+    /// `Some((key_size, value_size))` if every record in this format has the
+    /// same size. Formats with a fixed layout can write packed final output.
+    const FIXED_RECORD_LAYOUT: Option<(usize, usize)> = None;
 
     fn new_run(
         writer: AlignedWriter,
@@ -135,6 +139,36 @@ pub trait RunFormat: Clone + Send + Sync + 'static {
     ) -> usize
     where
         Self: Sized;
+
+    /// Final-merge variant for packed output: merge the records in
+    /// `[lower_bound, upper_bound)` and write them to `output` as packed
+    /// fixed-size records at this range's exact position in the sorted order.
+    /// Returns the number of records written.
+    ///
+    /// Must release the sparse indexes to `page_pool` and wait on `barrier`
+    /// exactly once, like the other `create_merge_sources_*` methods, even on
+    /// error, so the other merge threads are not left waiting.
+    #[allow(clippy::too_many_arguments)]
+    fn create_merge_sources_and_write_packed(
+        runs: &[MergeableRun<Self>],
+        lower_bound: Option<(&[u8], u32, usize)>,
+        upper_bound: Option<(&[u8], u32, usize)>,
+        io_tracker: Option<IoStatsTracker>,
+        page_pool: &SparseIndexPagePool,
+        barrier: &Barrier,
+        thread_id: usize,
+        output: &std::fs::File,
+    ) -> Result<usize, String>
+    where
+        Self: Sized,
+    {
+        let _ = (lower_bound, upper_bound, io_tracker, thread_id, output);
+        for run in runs {
+            run.release_sparse_index_to_pool(page_pool);
+        }
+        barrier.wait();
+        Err("Packed output is not supported by this run format".to_string())
+    }
 
     /// Seed the output run's sparse index with pre-allocated pages.
     fn seed_sparse_index_buffer(
@@ -962,14 +996,36 @@ impl<F: RunFormat> SortHooks for FormatSortHooks<F> {
         upper_bound: Option<(&[u8], u32, usize)>,
         dir: &Path,
         io_tracker: Arc<IoStatsTracker>,
-        discard_output: bool,
+        target: MergeTarget,
         page_pool: Arc<SparseIndexPagePool>,
         barrier: Arc<Barrier>,
         merge_threads: usize,
     ) -> Result<(Self::MergeableRun, u128), String> {
         let thread_start = Instant::now();
 
-        if discard_output {
+        if let MergeTarget::Packed(file) = &target {
+            let entries = F::create_merge_sources_and_write_packed(
+                &*runs,
+                lower_bound,
+                upper_bound,
+                Some((*io_tracker).clone()),
+                &page_pool,
+                &barrier,
+                thread_id,
+                file,
+            )?;
+            let record_size = F::FIXED_RECORD_LAYOUT.map_or(0, |(k, v)| k + v);
+            let thread_time_ms = thread_start.elapsed().as_millis();
+            return Ok((
+                MergeableRun::StatsOnly {
+                    entries,
+                    bytes: entries * record_size,
+                },
+                thread_time_ms,
+            ));
+        }
+
+        if matches!(target, MergeTarget::Discard) {
             let entries = F::create_merge_sources_and_discard(
                 &*runs,
                 lower_bound,
@@ -1032,6 +1088,10 @@ impl<F: RunFormat> SortHooks for FormatSortHooks<F> {
 
     fn sparse_indexes<'a>(&self, run: &'a Self::MergeableRun) -> MultiSparseIndexes<'a> {
         run.sparse_indexes()
+    }
+
+    fn fixed_record_layout(&self) -> Option<(usize, usize)> {
+        F::FIXED_RECORD_LAYOUT
     }
 
     fn into_output(&self, run: Self::MergeableRun, stats: SortStats) -> Box<dyn SortOutput> {

@@ -1,4 +1,5 @@
 pub mod core;
+pub mod fixed;
 pub mod ovc;
 pub mod plain;
 pub mod run_sink;

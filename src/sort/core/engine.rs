@@ -22,6 +22,57 @@ use rand::Rng;
 
 pub type Scanner = Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send>;
 
+/// Sorted output stored as a packed file of fixed-size records
+/// (`FinalOutput::Packed`). The file stays on disk after this is dropped.
+pub struct PackedFileOutput {
+    pub path: PathBuf,
+    pub key_size: usize,
+    pub value_size: usize,
+    pub stats: SortStats,
+}
+
+impl SortOutput for PackedFileOutput {
+    fn iter(&self) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)>> {
+        let input = crate::GenSortInputDirect::with_record_layout(
+            &self.path,
+            self.key_size,
+            self.value_size,
+        )
+        .unwrap_or_else(|e| panic!("Failed to open packed output {:?}: {}", self.path, e));
+        match input.create_parallel_scanners(1, None).into_iter().next() {
+            Some(scanner) => scanner,
+            None => Box::new(std::iter::empty()),
+        }
+    }
+
+    fn stats(&self) -> SortStats {
+        self.stats.clone()
+    }
+}
+
+/// What the final merge does with its output.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum FinalOutput {
+    /// Write the result as run files in the temp directory (default).
+    #[default]
+    Runs,
+    /// Merge but write nothing (benchmarking).
+    Discard,
+    /// Write the result as packed fixed-size records (`[key][value]...`) to this
+    /// path. Requires a run format with a fixed record layout.
+    Packed(PathBuf),
+}
+
+/// Where a single merge step writes, as passed to `SortHooks::merge_range`.
+/// Only the final merge ever receives `Discard` or `Packed`.
+#[derive(Clone)]
+pub enum MergeTarget {
+    Runs,
+    Discard,
+    /// Shared output file, already sized to hold every record of this merge.
+    Packed(Arc<std::fs::File>),
+}
+
 pub struct RunGenerationThreadResult<R> {
     pub runs: Vec<R>,
     pub load_ms: u128,
@@ -201,11 +252,17 @@ pub trait SortHooks: Clone + Send + Sync + 'static {
         upper_exc: Option<(&[u8], u32, usize)>,
         dir: &Path,
         io_tracker: Arc<IoStatsTracker>,
-        discard_output: bool,
+        target: MergeTarget,
         page_pool: Arc<SparseIndexPagePool>,
         barrier: Arc<Barrier>,
         merge_threads: usize,
     ) -> Result<(Self::MergeableRun, u128), String>;
+
+    /// `(key_size, value_size)` when every record has a fixed size, which is
+    /// required for `FinalOutput::Packed`.
+    fn fixed_record_layout(&self) -> Option<(usize, usize)> {
+        None
+    }
 
     fn sparse_indexes<'a>(&self, run: &'a Self::MergeableRun) -> MultiSparseIndexes<'a>;
 
@@ -242,7 +299,7 @@ pub struct SorterCore<H: SortHooks> {
     imbalance_factor: f64,
     partition_type: PartitionType,
     temp_dir_info: Arc<TempDirInfo>,
-    discard_final_output: bool,
+    final_output: FinalOutput,
     /// Fraction of `run_gen_mem` (and per-merge memory) reserved for sparse
     /// index pages; the remainder is the data buffer.  Default 0.05; CLIs
     /// usually overwrite this via `set_sparse_index_fraction` from a
@@ -283,7 +340,7 @@ impl<H: SortHooks> SorterCore<H> {
                 path: temp_dir,
                 should_delete: true,
             }),
-            discard_final_output: false,
+            final_output: FinalOutput::Runs,
             sparse_index_fraction: 0.05,
         }
     }
@@ -301,7 +358,26 @@ impl<H: SortHooks> SorterCore<H> {
     }
 
     pub fn set_discard_final_output(&mut self, discard: bool) {
-        self.discard_final_output = discard;
+        if discard {
+            self.final_output = FinalOutput::Discard;
+        } else if self.final_output == FinalOutput::Discard {
+            self.final_output = FinalOutput::Runs;
+        }
+    }
+
+    /// Write the sorted result to `path` as packed fixed-size records.
+    /// Only supported by run formats with a fixed record layout; `sort` returns
+    /// an error otherwise.
+    pub fn set_packed_output(&mut self, path: impl Into<PathBuf>) {
+        self.final_output = FinalOutput::Packed(path.into());
+    }
+
+    pub fn set_final_output(&mut self, final_output: FinalOutput) {
+        self.final_output = final_output;
+    }
+
+    pub fn final_output(&self) -> &FinalOutput {
+        &self.final_output
     }
 
     /// Override the fraction of run-gen / merge memory reserved for sparse
@@ -365,7 +441,7 @@ impl<H: SortHooks> SorterCore<H> {
             self.partition_type,
             merge_indexing_interval,
             self.temp_dir_info.as_ref().as_ref(),
-            self.discard_final_output,
+            &self.final_output,
         )
     }
 
@@ -426,7 +502,7 @@ impl<H: SortHooks> SorterCore<H> {
             partition_type,
             merge_indexing_interval,
             dir.as_ref(),
-            false, // Default: don't discard output
+            &FinalOutput::Runs,
         )
     }
 }
@@ -454,6 +530,14 @@ impl<H: SortHooks + Default> SorterCore<H> {
 
 impl<H: SortHooks> crate::Sorter for SorterCore<H> {
     fn sort(&mut self, sort_input: Box<dyn SortInput>) -> Result<Box<dyn SortOutput>, String> {
+        let packed_layout = match &self.final_output {
+            FinalOutput::Packed(_) => Some(
+                self.hooks
+                    .fixed_record_layout()
+                    .ok_or_else(|| "Packed output requires a fixed-size run format".to_string())?,
+            ),
+            _ => None,
+        };
         let run_indexing_interval = self.run_generation_indexing_interval();
         let estimated_total_data_bytes = sort_input.estimated_size_bytes().map(|value| {
             if value > usize::MAX as u64 {
@@ -468,9 +552,19 @@ impl<H: SortHooks> crate::Sorter for SorterCore<H> {
             estimated_total_data_bytes,
         )?;
         let (merged_run, merge_stats) = self.multi_merge_internal(runs, run_indexing_interval)?;
-        let output = self
-            .hooks
-            .into_output(merged_run, SortStats::new(run_gen_stats, merge_stats));
+        let stats = SortStats::new(run_gen_stats, merge_stats);
+        if let (FinalOutput::Packed(path), Some((key_size, value_size))) =
+            (&self.final_output, packed_layout)
+        {
+            drop(merged_run);
+            return Ok(Box::new(PackedFileOutput {
+                path: path.clone(),
+                key_size,
+                value_size,
+                stats,
+            }));
+        }
+        let output = self.hooks.into_output(merged_run, stats);
         Ok(output)
     }
 }
@@ -548,12 +642,18 @@ fn multi_merge_with_hooks<H: SortHooks>(
     partition_type: PartitionType,
     run_indexing_interval: IndexingInterval,
     dir: &Path,
-    discard_final_output: bool,
+    final_output: &FinalOutput,
 ) -> Result<(H::MergeableRun, Vec<MergeStats>), String> {
     let dir = dir.as_ref();
     let mut per_merge_stats = Vec::new();
+    let packed = matches!(final_output, FinalOutput::Packed(_));
 
     if runs.is_empty() {
+        if let FinalOutput::Packed(path) = final_output {
+            // No input records: the output is an empty file.
+            std::fs::File::create(path)
+                .map_err(|e| format!("Failed to create output file {:?}: {}", path, e))?;
+        }
         let merge_stats = MergeStats {
             output_runs: 0,
             merge_entry_num: vec![],
@@ -566,7 +666,9 @@ fn multi_merge_with_hooks<H: SortHooks>(
         return Ok((hooks.dummy_run(), vec![merge_stats]));
     }
 
-    if runs.len() == 1 {
+    // A single run needs no merge, unless the result must be written as a
+    // packed file: then it goes through the normal (parallel) merge path below.
+    if runs.len() == 1 && !packed {
         let run = runs.into_iter().next().unwrap();
         let merge_stats = MergeStats {
             output_runs: 1,
@@ -590,7 +692,7 @@ fn multi_merge_with_hooks<H: SortHooks>(
             partition_type,
             run_indexing_interval,
             dir,
-            discard_final_output,
+            final_output,
         )?;
         per_merge_stats.push(stats);
         return Ok((merged_run, per_merge_stats));
@@ -621,7 +723,11 @@ fn multi_merge_with_hooks<H: SortHooks>(
         let total_entries: usize = batch.iter().map(|r| r.total_entries()).sum();
         // Check if this will be the final merge (runs will have 0 after drain, 1 after push)
         let is_final_merge = runs.is_empty();
-        let should_discard = is_final_merge && discard_final_output;
+        let merge_output = if is_final_merge {
+            final_output
+        } else {
+            &FinalOutput::Runs
+        };
         let (merged_run, stats) = merge_once_with_hooks(
             hooks,
             batch,
@@ -630,7 +736,7 @@ fn multi_merge_with_hooks<H: SortHooks>(
             partition_type,
             run_indexing_interval,
             dir,
-            should_discard,
+            merge_output,
         )?;
         println!(
             "Merge {}/{}: merging {} shortest runs ({} total entries)",
@@ -656,7 +762,7 @@ fn merge_once_with_hooks<H: SortHooks>(
     partition_type: PartitionType,
     run_indexing_interval: IndexingInterval,
     dir: &Path,
-    discard_output: bool,
+    final_output: &FinalOutput,
 ) -> Result<(H::MergeableRun, MergeStats), String> {
     if output_runs.is_empty() {
         let merge_stats = MergeStats {
@@ -671,7 +777,8 @@ fn merge_once_with_hooks<H: SortHooks>(
         return Ok((hooks.dummy_run(), merge_stats));
     }
 
-    if output_runs.len() == 1 {
+    let packed = matches!(final_output, FinalOutput::Packed(_));
+    if output_runs.len() == 1 && !packed {
         let entry_count = output_runs[0].total_entries() as u64;
         let entry_bytes = output_runs[0].total_bytes() as u64;
         let merge_stats = MergeStats {
@@ -701,6 +808,37 @@ fn merge_once_with_hooks<H: SortHooks>(
 
     let merge_start = Instant::now();
     let merge_threads = num_threads;
+
+    // Resolve where this merge writes. For packed output the main thread creates
+    // the output file at its final size; each merge thread then writes its own
+    // key range at its exact offset.
+    let mut packed_file: Option<Arc<std::fs::File>> = None;
+    let target = match final_output {
+        FinalOutput::Runs => MergeTarget::Runs,
+        FinalOutput::Discard => MergeTarget::Discard,
+        FinalOutput::Packed(path) => {
+            let (key_size, value_size) = hooks
+                .fixed_record_layout()
+                .ok_or_else(|| "Packed output requires a fixed-size run format".to_string())?;
+            let total_entries: usize = output_runs.iter().map(|run| run.total_entries()).sum();
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+                .map_err(|e| format!("Failed to create output file {:?}: {}", path, e))?;
+            file.set_len((total_entries * (key_size + value_size)) as u64)
+                .map_err(|e| format!("Failed to size output file {:?}: {}", path, e))?;
+            let file = Arc::new(file);
+            packed_file = Some(Arc::clone(&file));
+            println!(
+                "Writing {} packed records ({}-byte keys, {}-byte values) to {:?}",
+                total_entries, key_size, value_size, path
+            );
+            MergeTarget::Packed(file)
+        }
+    };
 
     println!(
         "Merging {} runs using {} threads",
@@ -735,6 +873,7 @@ fn merge_once_with_hooks<H: SortHooks>(
         let run_id = run_id_base + thread_id as u32;
         let page_pool = Arc::clone(&page_pool);
         let barrier = Arc::clone(&barrier);
+        let target = target.clone();
 
         let handle = thread::spawn(move || {
             let indexes: Vec<_> = runs.iter().map(|run| hooks.sparse_indexes(run)).collect();
@@ -816,7 +955,7 @@ fn merge_once_with_hooks<H: SortHooks>(
                     upper_exc,
                     &dir,
                     io_tracker,
-                    discard_output,
+                    target,
                     page_pool,
                     barrier,
                     merge_threads,
@@ -857,6 +996,13 @@ fn merge_once_with_hooks<H: SortHooks>(
         .into_iter()
         .map(|(_, stats)| stats)
         .collect();
+
+    // Make the packed output durable before stopping the clock, so its timing
+    // is comparable with the O_DIRECT writes used for run files.
+    if let Some(file) = packed_file {
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync output file: {}", e))?;
+    }
 
     let merge_time_ms = merge_start.elapsed().as_millis();
     let merge_io_stats = if per_thread_io_stats.is_empty() {

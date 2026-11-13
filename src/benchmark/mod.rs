@@ -13,7 +13,7 @@ pub use reporting::{
     print_benchmark_summary,
 };
 pub use runner::BenchmarkRunner;
-pub use types::{BenchmarkConfig, BenchmarkResult};
+pub use types::{BenchmarkConfig, BenchmarkResult, RunFormatChoice};
 pub use verification::{
     LineitemCsvVerifier, OutputVerifier, SimpleVerifier, YellowTaxiCsvVerifier,
 };

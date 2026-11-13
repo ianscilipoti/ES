@@ -1,7 +1,8 @@
 use clap::{ArgAction, Parser};
+use es::SUPPORTED_FIXED_LAYOUTS;
 use es::benchmark::{
     BenchmarkConfig, BenchmarkInputProvider, BenchmarkResult, BenchmarkRunner,
-    GenSortInputProvider, SimpleVerifier, print_benchmark_summary,
+    GenSortInputProvider, RunFormatChoice, SimpleVerifier, print_benchmark_summary,
 };
 use es::diskio::constants::DEFAULT_BUFFER_SIZE;
 use es::sort::core::engine::PartitionType;
@@ -23,6 +24,16 @@ impl From<PartitionArg> for PartitionType {
             PartitionArg::SizeBalanced => PartitionType::SizeBalanced,
         }
     }
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum RunFormatArg {
+    /// Length-prefixed records
+    Plain,
+    /// Offset-value coding
+    Ovc,
+    /// Fixed-size records sized by --key-size / --value-size; supports --output
+    Fixed,
 }
 
 #[derive(Parser)]
@@ -62,9 +73,18 @@ struct SortArgs {
     #[arg(long, default_value = "0")]
     cooldown_seconds: u64,
 
-    /// Use OVC (Offset Value Coding) format
+    /// Use OVC (Offset Value Coding) format. Ignored when --run-format is given.
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     ovc: bool,
+
+    /// Run-file format (`plain`, `ovc`, `fixed`). Defaults to the --ovc setting.
+    #[arg(long, value_name = "FORMAT")]
+    run_format: Option<RunFormatArg>,
+
+    /// Write the sorted records to this file in the input's packed layout
+    /// (key bytes then value bytes, no delimiters). Requires --run-format fixed.
+    #[arg(short, long, value_name = "PATH")]
+    output: Option<PathBuf>,
 
     /// Automatically derive run_gen_threads, merge_threads, rg_buf_mb and
     /// merge_fanin from the dataset size and the budget (--memory-mb,
@@ -125,8 +145,59 @@ struct SortArgs {
     print_plan: bool,
 }
 
+/// Resolve the run format and check the output options before doing any work.
+fn resolve_run_format(args: &SortArgs) -> Result<RunFormatChoice, String> {
+    let run_format = match args.run_format {
+        Some(RunFormatArg::Plain) => RunFormatChoice::Plain,
+        Some(RunFormatArg::Ovc) => RunFormatChoice::Ovc,
+        Some(RunFormatArg::Fixed) => RunFormatChoice::Fixed {
+            key_size: args.key_size,
+            value_size: args.value_size,
+        },
+        None => RunFormatChoice::from_ovc_flag(args.ovc),
+    };
+
+    if matches!(run_format, RunFormatChoice::Fixed { .. })
+        && !SUPPORTED_FIXED_LAYOUTS.contains(&(args.key_size, args.value_size))
+    {
+        let supported: Vec<String> = SUPPORTED_FIXED_LAYOUTS
+            .iter()
+            .map(|(k, v)| format!("{k}/{v}"))
+            .collect();
+        return Err(format!(
+            "--run-format fixed is not compiled for {}-byte keys / {}-byte values (supported: {}). \
+             Add the size to SUPPORTED_FIXED_LAYOUTS and dispatch_fixed_layout! in src/sort/fixed/sorter.rs",
+            args.key_size,
+            args.value_size,
+            supported.join(", ")
+        ));
+    }
+
+    if let Some(output) = &args.output {
+        if !matches!(run_format, RunFormatChoice::Fixed { .. }) {
+            return Err("--output requires --run-format fixed".to_string());
+        }
+        if args.discard_final_output {
+            return Err("--output cannot be combined with --discard-final-output".to_string());
+        }
+        let same_file = match (
+            std::fs::canonicalize(&args.input),
+            std::fs::canonicalize(output),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if same_file {
+            return Err("--output must not be the input file".to_string());
+        }
+    }
+    Ok(run_format)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = SortArgs::parse();
+    let run_format = resolve_run_format(&args)?;
+    let output_path = args.output.clone();
 
     // Create input provider for GenSort files
     let input_provider =
@@ -211,7 +282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         verify: args.verify,
         temp_dir: args.dir,
         run_gen_threads,
-        use_ovc: args.ovc,
+        run_format,
         rg_buf_mb,
         run_gen_memory_mb: rg_buf_mb * run_gen_threads as f64,
         merge_threads,
@@ -222,6 +293,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         imbalance_factor: args.imbalance_factor,
         partition_type,
         discard_final_output: args.discard_final_output,
+        output: output_path,
         sparse_index_fraction: args.sparse_index_fraction,
     };
 
