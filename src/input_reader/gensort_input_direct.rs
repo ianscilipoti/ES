@@ -7,8 +7,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 // GenSort format constants
-const KEY_SIZE: usize = 10;
-const PAYLOAD_SIZE: usize = 90;
+const KEY_SIZE: usize = 8;
+const PAYLOAD_SIZE: usize = 8;
 const RECORD_SIZE: usize = KEY_SIZE + PAYLOAD_SIZE;
 
 /// Direct I/O reader for GenSort binary format
