@@ -106,6 +106,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Run-gen memory (MB):        {:.2}", plan.run_gen_memory_mb);
     println!("Merge memory (MB):          {:.2}", plan.merge_memory_mb);
     println!("Single merge step:          {}", plan.is_single_step);
+    println!();
+    // rg_buf_mb uses `{}` (shortest round-trip form) so pasting the flags
+    // reproduces the planner's buffer size exactly.
+    println!("== sort_to_file flags (copy/paste) ==");
+    println!(
+        "--run-gen-threads {} --merge-threads {} --rg-buf-mb {} --merge-fanin {} \
+         --sparse-index-fraction {} --write-output {}",
+        plan.run_gen_threads,
+        plan.merge_threads,
+        plan.rg_buf_mb,
+        plan.merge_fanin,
+        args.sparse_index_fraction,
+        args.write_output,
+    );
 
     Ok(())
 }
